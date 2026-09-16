@@ -1,0 +1,21 @@
+{
+  "name": "siempre-connector",
+  "version": "1.0.0",
+  "description": "Conector multi-canal (Mercado Libre / Falabella / Shopify) -> Bsale para emision automatica de boletas y facturas electronicas en Chile",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test test/*.test.js",
+    "bsale:types": "node scripts/bsale-document-types.js",
+    "ml:auth-url": "node scripts/ml-auth-url.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "express": "^4.21.2"
+  }
+}
