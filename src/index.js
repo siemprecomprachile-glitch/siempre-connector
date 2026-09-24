@@ -8,6 +8,8 @@ import { mercadolibreChannel } from './channels/mercadolibre/index.js';
 import { shopifyChannel } from './channels/shopify/index.js';
 import { allChannels } from './channels/index.js';
 import { renderPanel } from './web/panel.js';
+import { bsale } from './bsale/client.js';
+import { resolveDocTypeIds, docTypeSummary } from './bsale/doctypes.js';
 
 /** Estado de cada canal para el panel y para /health. */
 function channelStatus() {
@@ -43,6 +45,7 @@ app.get('/health', (_req, res) => {
     channels: channelStatus(),
     mercadolibre: mercadolibreChannel.connectionInfo(),
     orders: orders.counts(),
+    bsaleDocTypes: docTypeSummary(),
   });
 });
 
@@ -220,32 +223,29 @@ app.post('/panel/sweep', requireAdmin, async (req, res) => {
 });
 
 
-// Utilidad: lista los tipos de documento y formas de pago de Bsale con sus IDs.
+// Utilidad: muestra los IDs de Bsale que el conector tiene activos (deducidos solos
+// por codigo SII o puestos a mano) y lista los tipos de documento y formas de pago.
 // Abrir en el navegador: /panel/bsale/tipos?token=TU_ADMIN_TOKEN
 app.get('/panel/bsale/tipos', requireAdmin, async (_req, res) => {
-  const base = config.bsale.apiUrl;
-  const token = config.bsale.token;
-  if (!token) return res.status(400).send('Falta BSALE_ACCESS_TOKEN en las variables de entorno.');
+  if (!config.bsale.token) return res.status(400).send('Falta BSALE_ACCESS_TOKEN en las variables de entorno.');
   try {
-    const h = { access_token: token, Accept: 'application/json' };
-    const get = async (p) => {
-      const r = await fetch(`${base}${p}`, { headers: h });
-      if (!r.ok) throw new Error(`${p} devolvio HTTP ${r.status}`);
-      return r.json();
-    };
-    const [dt, pt] = await Promise.all([
-      get('/document_types.json?limit=50'),
-      get('/payment_types.json?limit=50'),
-    ]);
+    const ids = await resolveDocTypeIds({ force: true });
+    const [dt, pt] = await Promise.all([bsale.documentTypes(), bsale.paymentTypes()]);
     const esc = (v) => String(v ?? '').replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
-    const dtRows = (dt.items || []).map((d) => `<tr><td><b>${d.id}</b></td><td>${esc(d.name)}</td><td>${esc(d.codeSii)}</td></tr>`).join('');
+    const active = [ids.boletaTypeId, ids.facturaTypeId, ids.notaCreditoTypeId];
+    const mark = (id) => (active.includes(id) ? ' style="background:#e6ffed"' : '');
+    const dtRows = (dt.items || []).map((d) => `<tr${mark(d.id)}><td><b>${d.id}</b></td><td>${esc(d.name)}</td><td>${esc(d.codeSii)}</td></tr>`).join('');
     const ptRows = (pt.items || []).map((p) => `<tr><td><b>${p.id}</b></td><td>${esc(p.name)}</td></tr>`).join('');
+    const ok = ids.complete;
     res.type('html').send(
-      `<meta charset="utf-8"><style>body{font-family:sans-serif;padding:24px;line-height:1.5}table{border-collapse:collapse;margin:8px 0 24px}td,th{border:1px solid #ccc;padding:6px 14px;text-align:left}th{background:#f3f3f3}b{font-size:16px}</style>` +
-        `<h2>Tipos de documento — usa la columna ID</h2>` +
+      `<meta charset="utf-8"><style>body{font-family:sans-serif;padding:24px;line-height:1.5;max-width:900px}table{border-collapse:collapse;margin:8px 0 24px}td,th{border:1px solid #ccc;padding:6px 14px;text-align:left}th{background:#f3f3f3}pre{background:#f6f8fa;padding:12px;border-radius:6px}.ok{color:#1a7f37}.bad{color:#b42318}</style>` +
+        `<h2>IDs de Bsale activos en el conector</h2>` +
+        `<p class="${ok ? 'ok' : 'bad'}"><b>${ok ? 'Listo: el conector ya tiene los 3 IDs (filas verdes abajo).' : 'Faltan IDs: no se encontro un tipo con ese codigo SII. Ponlos a mano en Render.'}</b></p>` +
+        `<pre>BSALE_DOCTYPE_BOLETA_ID=${ids.boletaTypeId ?? ''}\nBSALE_DOCTYPE_FACTURA_ID=${ids.facturaTypeId ?? ''}\nBSALE_DOCTYPE_NOTA_CREDITO_ID=${ids.notaCreditoTypeId ?? ''}</pre>` +
+        `<p>Se deducen solos por codigo SII (boleta 39, factura 33, nota de credito 61). Si quieres usar otro tipo, pon su ID en Render y ese manda.</p>` +
+        `<h2>Tipos de documento de tu cuenta</h2>` +
         `<table><tr><th>ID</th><th>Nombre</th><th>codeSii</th></tr>${dtRows}</table>` +
-        `<p><b>Boleta</b> electronica = codeSii <b>39</b> &nbsp;·&nbsp; <b>Factura</b> = codeSii <b>33</b> &nbsp;·&nbsp; <b>Nota de credito</b> = codeSii <b>61</b></p>` +
-        `<h2>Formas de pago</h2>` +
+        `<h2>Formas de pago (opcional: BSALE_PAYMENT_TYPE_ID)</h2>` +
         `<table><tr><th>ID</th><th>Nombre</th></tr>${ptRows}</table>`
     );
   } catch (e) {
@@ -263,6 +263,7 @@ if (missing.length) {
 app.listen(config.port, '0.0.0.0', () => {
   log.info('server.listening', { port: config.port, publicUrl: config.publicUrl });
   log.info('server.webhook_url', { url: `${config.publicUrl}/webhooks/mercadolibre` });
+  resolveDocTypeIds();
   startWorker();
 });
 

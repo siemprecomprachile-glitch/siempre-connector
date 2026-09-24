@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { resolveDocTypeIds } from './doctypes.js';
 import { bsale } from './client.js';
 import { formatRut, looksLikeCompany } from '../core/rut.js';
 
@@ -116,6 +117,7 @@ async function buildDetails(order) {
 
 /** Arma el payload exacto que se envia a POST /v1/documents.json. */
 export async function buildDocumentPayload(order) {
+  await resolveDocTypeIds();
   const docKind = decideDocKind(order);
   const documentTypeId =
     docKind === 'factura' ? config.bsale.facturaTypeId : config.bsale.boletaTypeId;

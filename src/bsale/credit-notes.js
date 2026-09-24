@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { resolveDocTypeIds } from './doctypes.js';
 import { bsale } from './client.js';
 import { log } from '../logger.js';
 
@@ -37,6 +38,7 @@ async function detallesOriginales(documentId) {
  *                                   lineas. Sin esto se devuelve la venta completa.
  */
 export async function buildReturnPayload({ documentId, motive, parcial }) {
+  await resolveDocTypeIds();
   if (!config.bsale.notaCreditoTypeId) {
     const err = new Error('Falta configurar BSALE_DOCTYPE_NOTA_CREDITO_ID en el .env');
     err.permanent = true;
