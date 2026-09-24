@@ -219,6 +219,40 @@ app.post('/panel/sweep', requireAdmin, async (req, res) => {
   res.redirect(`/panel?token=${encodeURIComponent(req.body.token || req.query.token)}`);
 });
 
+
+// Utilidad: lista los tipos de documento y formas de pago de Bsale con sus IDs.
+// Abrir en el navegador: /panel/bsale/tipos?token=TU_ADMIN_TOKEN
+app.get('/panel/bsale/tipos', requireAdmin, async (_req, res) => {
+  const base = config.bsale.apiUrl;
+  const token = config.bsale.token;
+  if (!token) return res.status(400).send('Falta BSALE_ACCESS_TOKEN en las variables de entorno.');
+  try {
+    const h = { access_token: token, Accept: 'application/json' };
+    const get = async (p) => {
+      const r = await fetch(`${base}${p}`, { headers: h });
+      if (!r.ok) throw new Error(`${p} devolvio HTTP ${r.status}`);
+      return r.json();
+    };
+    const [dt, pt] = await Promise.all([
+      get('/document_types.json?limit=50'),
+      get('/payment_types.json?limit=50'),
+    ]);
+    const esc = (v) => String(v ?? '').replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+    const dtRows = (dt.items || []).map((d) => `<tr><td><b>${d.id}</b></td><td>${esc(d.name)}</td><td>${esc(d.codeSii)}</td></tr>`).join('');
+    const ptRows = (pt.items || []).map((p) => `<tr><td><b>${p.id}</b></td><td>${esc(p.name)}</td></tr>`).join('');
+    res.type('html').send(
+      `<meta charset="utf-8"><style>body{font-family:sans-serif;padding:24px;line-height:1.5}table{border-collapse:collapse;margin:8px 0 24px}td,th{border:1px solid #ccc;padding:6px 14px;text-align:left}th{background:#f3f3f3}b{font-size:16px}</style>` +
+        `<h2>Tipos de documento — usa la columna ID</h2>` +
+        `<table><tr><th>ID</th><th>Nombre</th><th>codeSii</th></tr>${dtRows}</table>` +
+        `<p><b>Boleta</b> electronica = codeSii <b>39</b> &nbsp;·&nbsp; <b>Factura</b> = codeSii <b>33</b> &nbsp;·&nbsp; <b>Nota de credito</b> = codeSii <b>61</b></p>` +
+        `<h2>Formas de pago</h2>` +
+        `<table><tr><th>ID</th><th>Nombre</th></tr>${ptRows}</table>`
+    );
+  } catch (e) {
+    res.status(500).send('Error consultando Bsale: ' + e.message);
+  }
+});
+
 // --- arranque ----------------------------------------------------------------
 
 const missing = assertConfig();
