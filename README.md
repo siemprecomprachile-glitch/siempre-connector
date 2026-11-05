@@ -15,6 +15,12 @@ para emitir boletas y facturas automaticamente.
   tiene una devolucion para ese documento.
 - `BSALE_DECLARE_SII=0` **no es una simulacion**: el documento se crea en Bsale
   (con numero, y descuenta stock si el SKU existe). Solo no se envia al SII.
+- `salesId` no detecta documentos hechos a mano o por otra integracion (Pivot).
+  La prueba controlada busca en Bsale documentos con el mismo monto o RUT: si
+  alguno menciona el pedido no deja emitir; si hay parecidos, exige revisarlos.
+- RUT de empresa sin razon social o giro: la factura queda bloqueada
+  ("Falta dato para la factura") hasta completar el dato. Nunca cambia a boleta.
+- Falabella y Shopify siguen con Pivot: quedan apagados en este conector.
 
 ## Endpoints de prueba (todos piden `?token=ADMIN_TOKEN`)
 
