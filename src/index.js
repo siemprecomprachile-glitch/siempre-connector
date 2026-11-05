@@ -6,8 +6,6 @@ import { processOrder, processRefund, retryOrder } from './core/process.js';
 import { startWorker, sweepChannels, sweepRefunds, tick } from './core/worker.js';
 import { mercadolibreChannel } from './channels/mercadolibre/index.js';
 import { shopifyChannel } from './channels/shopify/index.js';
-import { fetchParisOrders, processParisOrder } from './paris/index.js';
-import { fetchLiderOrders, processLiderOrder } from './lider/index.js';
 import { allChannels } from './channels/index.js';
 import { renderPanel } from './web/panel.js';
 import { bsale } from './bsale/client.js';
