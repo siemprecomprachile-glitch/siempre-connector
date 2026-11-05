@@ -1,6 +1,7 @@
 import { getChannel } from '../channels/index.js';
 import { orders } from '../db.js';
 import { buildDocumentPayload, salesIdFor } from '../bsale/documents.js';
+import { channelStartAt } from '../config.js';
 
 /**
  * Diagnostico de solo lectura. Nada de este archivo llama a processOrder ni a
@@ -21,7 +22,7 @@ export async function probeChannel(name, { limit = 10 } = {}) {
 
   try {
     const ids = await channel.listRecentOrderIds(limit);
-    return {
+    const res = {
       ...out,
       ok: true,
       found: ids.length,
@@ -29,6 +30,11 @@ export async function probeChannel(name, { limit = 10 } = {}) {
       alreadyRegistered: ids.filter((id) => orders.find(name, id)).length,
       ms: Date.now() - started,
     };
+    // Lider: cuantas hay sin confirmar o canceladas (no aparecen en `found`).
+    if (typeof channel.recentOrderSummary === 'function') {
+      res.summary = await channel.recentOrderSummary(limit);
+    }
+    return res;
   } catch (err) {
     return { ...out, ok: false, error: err.message, status: err.status ?? null, ms: Date.now() - started };
   }
@@ -57,10 +63,16 @@ export async function previewOrder(name, externalId) {
     docKind: record?.emit_doc_kind || undefined,
     salesId: salesIdFor(name, externalId),
   });
+  const startAt = channelStartAt(name);
 
   return {
     ...out,
     registeredStatus: record ? record.status : null,
+    existingDocument: record?.bsale_document_id
+      ? { id: record.bsale_document_id, number: record.bsale_number, kind: record.doc_kind, url: record.bsale_url }
+      : null,
+    startAt: startAt ? startAt.toISOString() : null,
+    beforeStart: Boolean(startAt && order.createdAt < startAt),
     order: {
       reference: order.reference,
       createdAt: order.createdAt,
