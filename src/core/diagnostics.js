@@ -2,6 +2,21 @@ import { getChannel } from '../channels/index.js';
 import { orders } from '../db.js';
 import { buildDocumentPayload, salesIdFor } from '../bsale/documents.js';
 import { channelStartAt } from '../config.js';
+import { findExistingDocuments } from '../bsale/existing.js';
+
+/**
+ * Campos del pedido en el canal que hablan de facturacion (p. ej. una boleta
+ * ya subida a Paris). Se muestran tal cual para revisarlos a ojo.
+ */
+function invoiceHints(raw) {
+  const out = {};
+  for (const [k, v] of Object.entries(raw || {})) {
+    if (!/invoice|factur|boleta|dte|folio/i.test(k)) continue;
+    if (v == null || v === '' || (Array.isArray(v) && !v.length)) continue;
+    out[k] = typeof v === 'object' ? JSON.stringify(v).slice(0, 300) : v;
+  }
+  return out;
+}
 
 /**
  * Diagnostico de solo lectura. Nada de este archivo llama a processOrder ni a
@@ -59,18 +74,45 @@ export async function previewOrder(name, externalId) {
 
   const order = result.canonical;
   const record = orders.find(name, externalId);
-  const { docKind, payload } = await buildDocumentPayload(order, {
-    docKind: record?.emit_doc_kind || undefined,
-    salesId: salesIdFor(name, externalId),
-  });
+
+  // Factura sin los datos que exige el SII: se bloquea y se dice que falta.
+  // No se cambia a boleta por cuenta propia.
+  let docKind;
+  let payload = null;
+  let blocked = null;
+  try {
+    ({ docKind, payload } = await buildDocumentPayload(order, {
+      docKind: record?.emit_doc_kind || undefined,
+      salesId: salesIdFor(name, externalId),
+    }));
+  } catch (err) {
+    if (err.code !== 'MISSING_INVOICE_DATA') throw err;
+    docKind = 'factura';
+    blocked = { reason: 'missing_invoice_data', missing: err.missing || [], message: err.message };
+  }
   const startAt = channelStartAt(name);
+
+  const existingDocument = record?.bsale_document_id
+    ? { id: record.bsale_document_id, number: record.bsale_number, kind: record.doc_kind, url: record.bsale_url }
+    : null;
+
+  // ¿Ya se facturo a mano o por otra integracion? (salesId no lo detecta.)
+  let existingCheck = { ok: true, candidates: [] };
+  if (!existingDocument) {
+    try {
+      existingCheck = { ok: true, candidates: await findExistingDocuments(order, externalId) };
+    } catch (err) {
+      existingCheck = { ok: false, error: err.message, candidates: [] };
+    }
+  }
 
   return {
     ...out,
     registeredStatus: record ? record.status : null,
-    existingDocument: record?.bsale_document_id
-      ? { id: record.bsale_document_id, number: record.bsale_number, kind: record.doc_kind, url: record.bsale_url }
-      : null,
+    existingDocument,
+    existingCheck,
+    blocked,
+    channelInvoiceHints: invoiceHints(result.raw),
     startAt: startAt ? startAt.toISOString() : null,
     beforeStart: Boolean(startAt && order.createdAt < startAt),
     order: {
