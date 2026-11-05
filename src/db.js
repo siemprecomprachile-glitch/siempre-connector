@@ -73,6 +73,44 @@ agregarColumna('orders', 'nc_motive', 'TEXT');
 agregarColumna('orders', 'credited_at', 'INTEGER');
 agregarColumna('orders', 'last_refund_check', 'INTEGER');
 
+// Emision en curso: que tipo de documento se mando a Bsale y cuando. Si el
+// proceso se cae entre "Bsale lo creo" y "SQLite lo guardo", el reintento usa
+// el mismo tipo y el mismo salesId, y Bsale devuelve el documento ya creado.
+agregarColumna('orders', 'emit_doc_kind', 'TEXT');
+agregarColumna('orders', 'emit_started_at', 'INTEGER');
+
+// --- marca de almacenamiento -------------------------------------------------
+// Sirve para comprobar que la base sobrevive a reinicios y deploys: created_at
+// no cambia y boot_count sube. Si boot_count vuelve a 1, el disco se borro.
+
+db.exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+const metaGet = db.prepare('SELECT value FROM meta WHERE key = ?');
+const metaSet = db.prepare(
+  'INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+);
+db.prepare('INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)').run(
+  'created_at',
+  new Date().toISOString()
+);
+const bootCount = Number(metaGet.get('boot_count')?.value || 0) + 1;
+metaSet.run('boot_count', String(bootCount));
+metaSet.run('last_boot_at', new Date().toISOString());
+
+const dbFile = path.resolve(config.dataDir, 'connector.db');
+
+export const storage = {
+  info() {
+    return {
+      dataDir: path.resolve(config.dataDir),
+      dbFile,
+      createdAt: metaGet.get('created_at')?.value || null,
+      bootCount: Number(metaGet.get('boot_count')?.value || 0),
+      lastBootAt: metaGet.get('last_boot_at')?.value || null,
+      ordersTotal: db.prepare('SELECT COUNT(*) AS n FROM orders').get().n,
+    };
+  },
+};
+
 const now = () => Date.now();
 
 // --- ordenes -----------------------------------------------------------------
@@ -111,16 +149,20 @@ export const orders = {
     );
   },
 
-  /** Ordenes listas para reintentar. */
-  dueForRetry(limit = 20) {
+  /**
+   * Ordenes listas para reintentar. Incluye las que quedaron "processing" mas
+   * de staleMs: el proceso se cayo a mitad de camino y nadie las iba a retomar.
+   */
+  dueForRetry(limit = 20, staleMs = 10 * 60 * 1000) {
     return db
       .prepare(
         `SELECT * FROM orders
-         WHERE status IN ('pending', 'retry', 'credit_retry')
-           AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+         WHERE (status IN ('pending', 'retry', 'credit_retry')
+                AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+            OR (status = 'processing' AND updated_at <= ?)
          ORDER BY id ASC LIMIT ?`
       )
-      .all(now(), limit);
+      .all(now(), now() - staleMs, limit);
   },
 
   recent(limit = 100) {
