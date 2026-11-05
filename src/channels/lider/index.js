@@ -7,18 +7,54 @@ import { log } from '../../logger.js';
 /**
  * Lider / Walmart Chile Marketplace.
  *
- * Credenciales: Client ID + Client Secret del developer portal de Walmart.
- * El token dura 15 MINUTOS, asi que se pide uno nuevo casi en cada barrido.
- * Tampoco hay webhooks: se consulta cada X minutos.
- *
- * Igual que en Paris, todas las rutas y estados estan en este bloque.
+ * Segun la documentacion de Walmart (developer.walmart.com, Chile y Global):
+ *  - Host unico para todos los paises: https://marketplace.walmartapis.com.
+ *    El pais se elige con la cabecera WM_MARKET=cl. Las APIs legacy de Chile
+ *    estan en retiro; las Global piden ademas WM_GLOBAL_VERSION=3.1.
+ *  - Token: POST /v3/token, Basic base64(ClientID:ClientSecret),
+ *    grant_type=client_credentials. Dura 15 MINUTOS.
+ *  - Credenciales: Developer Portal > Marketplace (US, Mexico, Canada y Chile)
+ *    > API Keys > Production Keys. Solo el rol Administrador ve el Secret.
+ *  - Ordenes: GET /v3/orders (createdStartDate ISO-8601, limit) y
+ *    GET /v3/orders/{purchaseOrderId}. Sin webhooks: se consulta cada X min.
+ *  - Estados de linea: Created (nueva, falta confirmarla), Acknowledged
+ *    (confirmada por ti), Shipped, Delivered, Cancelled/Canceled.
  */
 const ENDPOINTS = {
   token: '/v3/token',
   orders: '/v3/orders',
   order: (id) => `/v3/orders/${encodeURIComponent(id)}`,
-  billableStatuses: ['Acknowledged', 'Shipped', 'Delivered'],
 };
+
+/** Se factura cuando la venta esta confirmada. Created todavia no. */
+const BILLABLE = ['Acknowledged', 'Shipped', 'Delivered'];
+
+/** Estado de una linea (la API lo entrega como lista). */
+export function lineStatus(line) {
+  const estados = line?.orderLineStatuses?.orderLineStatus || [];
+  const lista = Array.isArray(estados) ? estados : [estados];
+  return String(lista[lista.length - 1]?.status || lista[0]?.status || '');
+}
+
+const isCancelled = (status) => /cancel/i.test(status); // "Cancelled" y "Canceled"
+
+function linesOf(order) {
+  const lines = order?.orderLines?.orderLine || order?.orderLines || [];
+  return Array.isArray(lines) ? lines : [lines];
+}
+
+/**
+ * Que hacer con una orden segun sus lineas:
+ *  'skip'  todas canceladas
+ *  'wait'  hay lineas activas sin confirmar (Created): se espera
+ *  'bill'  todas las lineas activas estan confirmadas o despachadas
+ */
+export function billingState(order) {
+  const activas = linesOf(order).filter((l) => !isCancelled(lineStatus(l)));
+  if (!activas.length) return 'skip';
+  if (activas.every((l) => BILLABLE.includes(lineStatus(l)))) return 'bill';
+  return 'wait';
+}
 
 let cachedToken = null; // { value, expiresAt }
 
@@ -41,8 +77,7 @@ async function getToken() {
       Authorization: `Basic ${basic}`,
       'Content-Type': 'application/x-www-form-urlencoded',
       Accept: 'application/json',
-      'WM_SVC.NAME': 'Walmart Marketplace',
-      'WM_QOS.CORRELATION_ID': crypto.randomUUID(),
+      ...walmartHeaders(),
     },
     body: new URLSearchParams({ grant_type: 'client_credentials' }),
   });
@@ -63,14 +98,25 @@ async function getToken() {
   return cachedToken.value;
 }
 
+/** Cabeceras que Walmart pide en cada llamada (Chile + APIs Global). */
+function walmartHeaders() {
+  const h = {
+    'WM_SVC.NAME': 'Walmart Marketplace',
+    'WM_QOS.CORRELATION_ID': crypto.randomUUID(),
+    WM_MARKET: config.lider.market,
+  };
+  if (config.lider.channelType) h['WM_CONSUMER.CHANNEL.TYPE'] = config.lider.channelType;
+  return h;
+}
+
 async function call(path) {
   const token = await getToken();
   const res = await fetch(`${config.lider.apiUrl}${path}`, {
     headers: {
       Accept: 'application/json',
       'WM_SEC.ACCESS_TOKEN': token,
-      'WM_SVC.NAME': 'Walmart Marketplace',
-      'WM_QOS.CORRELATION_ID': crypto.randomUUID(),
+      WM_GLOBAL_VERSION: config.lider.globalVersion,
+      ...walmartHeaders(),
     },
   });
 
@@ -115,13 +161,7 @@ function extractRut(order) {
 
 export function toCanonicalOrder(order) {
   const addr = order.shippingInfo?.postalAddress || {};
-  const lines = order.orderLines?.orderLine || order.orderLines || [];
-
-  const activas = (Array.isArray(lines) ? lines : [lines]).filter((l) => {
-    const estados = l.orderLineStatuses?.orderLineStatus || [];
-    const estado = (Array.isArray(estados) ? estados[0] : estados)?.status || '';
-    return !/Cancelled/i.test(estado);
-  });
+  const activas = linesOf(order).filter((l) => !isCancelled(lineStatus(l)));
 
   const items = activas.map((l) => {
     const cargos = l.charges?.charge || [];
@@ -182,15 +222,42 @@ export const liderChannel = {
       err.permanent = true;
       throw err;
     }
+    const estado = billingState(order);
+    if (estado === 'skip') return { skip: 'todas las lineas estan canceladas', raw: order };
+    if (estado === 'wait') {
+      return { retryLater: 'Orden sin confirmar en Walmart (Created): se factura al quedar Acknowledged', raw: order };
+    }
     return { canonical: toCanonicalOrder(order), raw: order };
   },
 
+  /**
+   * Solo devuelve ordenes listas para facturar (todas sus lineas activas
+   * Acknowledged/Shipped/Delivered). Las Created no se registran: el proximo
+   * barrido las toma cuando se confirmen (si siguen dentro de las 48 h).
+   */
   async listRecentOrderIds(limit = 50) {
-    const desde = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
-    const params = new URLSearchParams({ createdStartDate: desde, limit: String(limit) });
-    const data = await call(`${ENDPOINTS.orders}?${params}`);
-    const ids = unwrapOrders(data).map((o) => String(o.purchaseOrderId || o.customerOrderId));
-    log.debug('lider.sweep', { encontradas: ids.length });
+    const orders = await recentOrders(limit);
+    const ids = orders
+      .filter((o) => billingState(o) === 'bill')
+      .map((o) => String(o.purchaseOrderId || o.customerOrderId));
+    log.debug('lider.sweep', { recibidas: orders.length, facturables: ids.length });
     return ids;
   },
+
+  /** Para el diagnostico: cuantas ordenes hay en cada estado. */
+  async recentOrderSummary(limit = 50) {
+    const orders = await recentOrders(limit);
+    const porEstado = {};
+    for (const o of orders) {
+      const e = billingState(o);
+      porEstado[e] = (porEstado[e] || 0) + 1;
+    }
+    return { recibidas: orders.length, facturables: porEstado.bill || 0, sinConfirmar: porEstado.wait || 0, canceladas: porEstado.skip || 0 };
+  },
 };
+
+async function recentOrders(limit) {
+  const desde = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
+  const params = new URLSearchParams({ createdStartDate: desde, limit: String(limit) });
+  return unwrapOrders(await call(`${ENDPOINTS.orders}?${params}`));
+}
