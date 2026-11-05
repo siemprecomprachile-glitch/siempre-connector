@@ -79,8 +79,51 @@ export function renderPreviewPage({ token, name, id, preview, error, declareSii 
   if (preview.registeredStatus && !yaTiene) {
     avisos.push(`<div class="box warn">Ya esta registrada en el conector con estado <b>${esc(preview.registeredStatus)}</b>.</div>`);
   }
+  if (preview.blocked) {
+    avisos.push(
+      `<div class="box bad"><b>Falta: ${esc(preview.blocked.missing.join(', '))}.</b> ${esc(preview.blocked.message)}</div>`
+    );
+  }
 
-  const form = yaTiene
+  // ¿Ya se facturo a mano o por otra integracion?
+  const chk = preview.existingCheck || { ok: true, candidates: [] };
+  const seguros = chk.candidates.filter((x) => x.mentionsOrder);
+  let revision = '';
+  if (!yaTiene) {
+    if (!chk.ok) {
+      revision = `<div class="box bad">No se pudo revisar en Bsale si esta venta ya esta facturada (${esc(chk.error)}). Sin esa revision no se emite.</div>`;
+    } else if (!chk.candidates.length) {
+      revision = `<div class="box ok">No hay documentos en Bsale con el mismo monto o el mismo RUT desde unos dias antes de la venta hasta hoy.</div>
+<p class="muted">Se busco por monto y RUT. Si la facturaste a mano con otro monto o sin RUT, no aparece aqui: revisalo tambien en Bsale y en el canal.</p>`;
+    } else {
+      revision = `<div class="box ${seguros.length ? 'bad' : 'warn'}">${
+        seguros.length
+          ? `<b>Parece ya facturada:</b> hay documentos que mencionan el pedido ${esc(id)}. No se emite.`
+          : `Hay ${chk.candidates.length} documento(s) parecidos (mismo monto o RUT). Revisalos antes de emitir.`
+      }</div>
+<table><tr><th>Documento</th><th>Fecha</th><th>Monto</th><th>Menciona el pedido</th></tr>${chk.candidates
+        .map(
+          (x) =>
+            `<tr><td>${esc(x.documentType || 'Documento')} N° ${esc(x.number)}${
+              x.url ? ` · <a href="${esc(x.url)}" target="_blank" rel="noopener">ver</a>` : ''
+            }</td><td>${esc(x.emissionDate)}</td><td>${clp(x.total)}</td><td>${x.mentionsOrder ? '<b>SI</b>' : 'no'}</td></tr>`
+        )
+        .join('')}</table>`;
+    }
+  }
+  const pistas = Object.entries(preview.channelInvoiceHints || {});
+  if (pistas.length) {
+    revision += `<p class="muted">Datos de facturacion que trae el canal: ${pistas
+      .map(([k, v]) => `<code>${esc(k)}</code>=${esc(v)}`)
+      .join(' · ')}</p>`;
+  }
+
+  const puedeEmitir = !yaTiene && !preview.blocked && chk.ok && !seguros.length;
+  const casilla = chk.candidates.length
+    ? `<p><label><input type="checkbox" name="revisado" value="si" required> Revise esos documentos en Bsale y no son esta venta.</label></p>`
+    : '';
+
+  const form = !puedeEmitir
     ? ''
     : `<h2>Emitir</h2>
 ${avisoSii(declareSii)}
@@ -88,6 +131,7 @@ ${avisoSii(declareSii)}
   <input type="hidden" name="token" value="${esc(token)}">
   <input type="hidden" name="expectedKind" value="${esc(preview.docKind)}">
   <input type="hidden" name="expectedTotal" value="${esc(o.total)}">
+  ${casilla}
   <p>Para emitir <b>esta ${esc(preview.docKind)} por ${clp(o.total)}</b>, escribe el numero de pedido <b>${esc(id)}</b>:</p>
   <p><input name="confirm" autocomplete="off" required> <button type="submit">Emitir este documento</button></p>
   <p class="muted">Si el pedido cambia entre esta vista y el clic (tipo o monto), no se emite.</p>
@@ -97,16 +141,18 @@ ${avisoSii(declareSii)}
 ${avisos.join('')}
 <h2>Documento previsto</h2>
 <table>
-<tr><th>Tipo</th><td><b>${esc(preview.docKind)}</b> (tipo Bsale ${esc(preview.payload.documentTypeId)})</td></tr>
+<tr><th>Tipo</th><td><b>${esc(preview.docKind)}</b>${preview.payload ? ` (tipo Bsale ${esc(preview.payload.documentTypeId)})` : ''}</td></tr>
 <tr><th>Monto total</th><td class="total">${clp(o.total)}</td></tr>
 <tr><th>Despacho</th><td>${clp(o.shippingCost)}</td></tr>
 <tr><th>Fecha de la venta</th><td>${esc(new Date(o.createdAt).toLocaleString('es-CL'))}</td></tr>
 <tr><th>Cliente</th><td>${esc(c.businessName || c.name)}${c.rut ? ` · RUT ${esc(c.rut)}` : ''}${c.activity ? ` · Giro ${esc(c.activity)}` : ''}</td></tr>
-<tr><th>Referencia anti-duplicados</th><td><code>${esc(preview.payload.salesId)}</code></td></tr>
+<tr><th>Referencia anti-duplicados</th><td><code>${esc(preview.payload?.salesId || '')}</code></td></tr>
 <tr><th>Fecha de inicio del canal</th><td>${preview.startAt ? esc(preview.startAt) : 'sin fecha (el canal no factura solo)'}</td></tr>
 </table>
 <h2>Detalle</h2>
 <table><tr><th>Cant.</th><th>Producto</th><th>Precio bruto</th><th>Subtotal</th></tr>${items}</table>
+<h2>¿Ya esta facturada?</h2>
+${revision || '<p class="muted">No aplica.</p>'}
 ${form}
 ${back}`;
   return page('Prueba controlada', body);
