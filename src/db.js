@@ -78,6 +78,11 @@ agregarColumna('orders', 'last_refund_check', 'INTEGER');
 // el mismo tipo y el mismo salesId, y Bsale devuelve el documento ya creado.
 agregarColumna('orders', 'emit_doc_kind', 'TEXT');
 agregarColumna('orders', 'emit_started_at', 'INTEGER');
+// Venta procesada por una accion explicita del panel (prueba controlada o
+// reintento manual): la fecha de inicio del canal no la bloquea.
+agregarColumna('orders', 'manual_ok', 'INTEGER');
+// Nota de credito: cuando se mando a Bsale (para auditar casos ambiguos).
+agregarColumna('orders', 'nc_started_at', 'INTEGER');
 
 // --- marca de almacenamiento -------------------------------------------------
 // Sirve para comprobar que la base sobrevive a reinicios y deploys: created_at
@@ -159,7 +164,7 @@ export const orders = {
         `SELECT * FROM orders
          WHERE (status IN ('pending', 'retry', 'credit_retry')
                 AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
-            OR (status = 'processing' AND updated_at <= ?)
+            OR (status IN ('processing', 'credit_processing') AND updated_at <= ?)
          ORDER BY id ASC LIMIT ?`
       )
       .all(now(), now() - staleMs, limit);
