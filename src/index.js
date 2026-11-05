@@ -1,7 +1,8 @@
 import express from 'express';
 import { config, assertConfig } from './config.js';
 import { log } from './logger.js';
-import { orders, events } from './db.js';
+import { orders, events, storage } from './db.js';
+import { probeChannel, previewOrder } from './core/diagnostics.js';
 import { processOrder, processRefund, retryOrder } from './core/process.js';
 import { startWorker, sweepChannels, sweepRefunds, tick } from './core/worker.js';
 import { mercadolibreChannel } from './channels/mercadolibre/index.js';
@@ -46,6 +47,7 @@ app.get('/health', (_req, res) => {
     mercadolibre: mercadolibreChannel.connectionInfo(),
     orders: orders.counts(),
     bsaleDocTypes: docTypeSummary(),
+    storage: storage.info(),
   });
 });
 
@@ -223,6 +225,27 @@ app.post('/panel/sweep', requireAdmin, async (req, res) => {
 });
 
 
+// Diagnostico de solo lectura (ver core/diagnostics.js): prueba credenciales y
+// lectura de pedidos con el canal apagado. No registra ventas ni emite nada.
+//   /panel/canales/paris/probar?token=...
+//   /panel/canales/paris/pedido/1234567890?token=...
+app.get('/panel/canales/:name/probar', requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(Number(req.query.limit) || 10, 1), 50);
+    res.json(await probeChannel(req.params.name, { limit }));
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/panel/canales/:name/pedido/:id', requireAdmin, async (req, res) => {
+  try {
+    res.json(await previewOrder(req.params.name, req.params.id));
+  } catch (err) {
+    res.status(400).json({ ok: false, sentToBsale: false, error: err.message });
+  }
+});
+
 // Utilidad: muestra los IDs de Bsale que el conector tiene activos (deducidos solos
 // por codigo SII o puestos a mano) y lista los tipos de documento y formas de pago.
 // Abrir en el navegador: /panel/bsale/tipos?token=TU_ADMIN_TOKEN
@@ -263,6 +286,7 @@ if (missing.length) {
 app.listen(config.port, '0.0.0.0', () => {
   log.info('server.listening', { port: config.port, publicUrl: config.publicUrl });
   log.info('server.webhook_url', { url: `${config.publicUrl}/webhooks/mercadolibre` });
+  log.info('server.storage', storage.info());
   resolveDocTypeIds();
   startWorker();
 });
