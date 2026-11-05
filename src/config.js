@@ -92,7 +92,13 @@ export const config = {
     enabled: bool(process.env.LIDER_ENABLED, false),
     clientId: process.env.LIDER_CLIENT_ID || '',
     clientSecret: process.env.LIDER_CLIENT_SECRET || '',
+    // Walmart usa el mismo host para todos los paises; Chile se elige con la
+    // cabecera WM_MARKET=cl. Las APIs "Global" piden WM_GLOBAL_VERSION=3.1.
     apiUrl: (process.env.LIDER_API_URL || 'https://marketplace.walmartapis.com').replace(/\/$/, ''),
+    market: process.env.LIDER_MARKET || 'cl',
+    globalVersion: process.env.LIDER_GLOBAL_VERSION || '3.1',
+    // Opcional: solo si Walmart lo entrego en el onboarding.
+    channelType: process.env.LIDER_CHANNEL_TYPE || '',
   },
 
   rules: {
@@ -102,8 +108,31 @@ export const config = {
     // Para Paris, Lider y Falabella este barrido no es red de seguridad:
     // es la unica forma de enterarse de una venta. Por eso va seguido.
     sweepIntervalMinutes: int(process.env.SWEEP_INTERVAL_MINUTES, 10),
+    // Notas de credito automaticas. APAGADAS por defecto: una devolucion
+    // detectada queda esperando que la apruebes en el panel.
+    autoCreditNotes: bool(process.env.AUTO_CREDIT_NOTES, false),
   },
 };
+
+/**
+ * Fecha desde la que un canal factura solo (PARIS_START_AT, LIDER_START_AT...).
+ * Las ventas anteriores nunca se facturan automaticamente. Sin fecha (o con
+ * una fecha invalida) el canal no factura NADA automatico: falla segura.
+ * Es configuracion, no base de datos: sobrevive aunque se borre el disco.
+ */
+export function channelStartAt(name) {
+  const raw = process.env[`${String(name).toUpperCase()}_START_AT`];
+  if (!raw) return null;
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** Para /health: la fecha de inicio tal como esta configurada. */
+export function channelStartInfo(name) {
+  const raw = process.env[`${String(name).toUpperCase()}_START_AT`] || null;
+  const d = channelStartAt(name);
+  return { startAt: d ? d.toISOString() : null, startAtInvalid: Boolean(raw && !d) };
+}
 
 export function assertConfig() {
   const missing = [];
