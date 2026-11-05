@@ -115,10 +115,25 @@ async function buildDetails(order) {
   return details;
 }
 
-/** Arma el payload exacto que se envia a POST /v1/documents.json. */
-export async function buildDocumentPayload(order) {
+/**
+ * Referencia unica de la venta para Bsale. Bsale usa `salesId` para evitar
+ * duplicidad: si ya existe un documento de ese tipo con el mismo salesId,
+ * devuelve el que ya genero en vez de crear otro.
+ */
+export function salesIdFor(channel, externalId) {
+  return `siempre:${channel}:${externalId}`.slice(0, 255);
+}
+
+/**
+ * Arma el payload exacto que se envia a POST /v1/documents.json.
+ *
+ * @param {object} [opts]
+ * @param {'boleta'|'factura'} [opts.docKind] tipo ya decidido en un intento anterior
+ * @param {string} [opts.salesId] referencia anti-duplicados (ver salesIdFor)
+ */
+export async function buildDocumentPayload(order, { docKind: fixedKind, salesId } = {}) {
   await resolveDocTypeIds();
-  const docKind = decideDocKind(order);
+  const docKind = fixedKind || decideDocKind(order);
   const documentTypeId =
     docKind === 'factura' ? config.bsale.facturaTypeId : config.bsale.boletaTypeId;
 
@@ -154,13 +169,35 @@ export async function buildDocumentPayload(order) {
   // Queda escrito en el documento de donde vino la venta.
   payload.dynamicAttributes = [{ description: 'Origen', value: order.reference }];
 
+  if (salesId) payload.salesId = salesId;
+
   return { docKind, payload };
 }
 
-/** Emite el documento en Bsale y devuelve los datos utiles. */
-export async function issueDocument(order) {
-  const { docKind, payload } = await buildDocumentPayload(order);
-  const doc = await bsale.createDocument(payload);
+/**
+ * Emite el documento en Bsale y devuelve los datos utiles.
+ *
+ * Si falla, el error lleva `postAttempted`: false significa que la peticion de
+ * emision nunca salio (faltaban datos, tipos, etc.), asi que es seguro que
+ * Bsale no creo nada.
+ */
+export async function issueDocument(order, opts = {}) {
+  let built;
+  try {
+    built = await buildDocumentPayload(order, opts);
+  } catch (err) {
+    err.postAttempted = false;
+    throw err;
+  }
+  const { docKind, payload } = built;
+
+  let doc;
+  try {
+    doc = await bsale.createDocument(payload);
+  } catch (err) {
+    err.postAttempted = true;
+    throw err;
+  }
 
   return {
     docKind,
