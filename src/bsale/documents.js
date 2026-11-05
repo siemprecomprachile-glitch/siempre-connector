@@ -7,8 +7,13 @@ const IVA = 0.19;
 
 /**
  * Decide boleta o factura.
- * Regla: hay factura solo si el comprador entrego RUT valido Y razon social.
- * Sin razon social el SII no acepta la factura, asi que cae a boleta.
+ * Reglas:
+ *  - Si el canal dice que pidio el comprador (Paris), se respeta.
+ *  - RUT con razon social, o RUT de empresa: factura.
+ *  - RUT de empresa SIN razon social: sigue siendo factura, y la emision se
+ *    bloquea pidiendo el dato que falta (buildClient). Nunca se cambia a boleta
+ *    por cuenta propia.
+ *  - Sin RUT, o RUT de persona sin razon social: boleta.
  */
 export function decideDocKind(order) {
   // Si el canal ya sabe lo que el comprador pidio, se le hace caso.
@@ -47,11 +52,13 @@ function buildClient(order, docKind) {
     if (!order.customer.address) missing.push('direccion');
     if (missing.length) {
       const err = new Error(
-        `No se puede emitir factura: falta ${missing.join(', ')}. ` +
-          `Completa los datos en el canal o emite boleta.`
+        `Factura bloqueada: falta ${missing.join(', ')}` +
+          `${rut ? ` del RUT ${rut}` : ''}. Pide el dato al comprador o completalo en el canal ` +
+          'y vuelve a intentar. No se emite boleta en su lugar.'
       );
       err.permanent = true;
       err.code = 'MISSING_INVOICE_DATA';
+      err.missing = missing;
       throw err;
     }
     return {
@@ -115,10 +122,25 @@ async function buildDetails(order) {
   return details;
 }
 
-/** Arma el payload exacto que se envia a POST /v1/documents.json. */
-export async function buildDocumentPayload(order) {
+/**
+ * Referencia unica de la venta para Bsale. Bsale usa `salesId` para evitar
+ * duplicidad: si ya existe un documento de ese tipo con el mismo salesId,
+ * devuelve el que ya genero en vez de crear otro.
+ */
+export function salesIdFor(channel, externalId) {
+  return `siempre:${channel}:${externalId}`.slice(0, 255);
+}
+
+/**
+ * Arma el payload exacto que se envia a POST /v1/documents.json.
+ *
+ * @param {object} [opts]
+ * @param {'boleta'|'factura'} [opts.docKind] tipo ya decidido en un intento anterior
+ * @param {string} [opts.salesId] referencia anti-duplicados (ver salesIdFor)
+ */
+export async function buildDocumentPayload(order, { docKind: fixedKind, salesId } = {}) {
   await resolveDocTypeIds();
-  const docKind = decideDocKind(order);
+  const docKind = fixedKind || decideDocKind(order);
   const documentTypeId =
     docKind === 'factura' ? config.bsale.facturaTypeId : config.bsale.boletaTypeId;
 
@@ -154,13 +176,35 @@ export async function buildDocumentPayload(order) {
   // Queda escrito en el documento de donde vino la venta.
   payload.dynamicAttributes = [{ description: 'Origen', value: order.reference }];
 
+  if (salesId) payload.salesId = salesId;
+
   return { docKind, payload };
 }
 
-/** Emite el documento en Bsale y devuelve los datos utiles. */
-export async function issueDocument(order) {
-  const { docKind, payload } = await buildDocumentPayload(order);
-  const doc = await bsale.createDocument(payload);
+/**
+ * Emite el documento en Bsale y devuelve los datos utiles.
+ *
+ * Si falla, el error lleva `postAttempted`: false significa que la peticion de
+ * emision nunca salio (faltaban datos, tipos, etc.), asi que es seguro que
+ * Bsale no creo nada.
+ */
+export async function issueDocument(order, opts = {}) {
+  let built;
+  try {
+    built = await buildDocumentPayload(order, opts);
+  } catch (err) {
+    err.postAttempted = false;
+    throw err;
+  }
+  const { docKind, payload } = built;
+
+  let doc;
+  try {
+    doc = await bsale.createDocument(payload);
+  } catch (err) {
+    err.postAttempted = true;
+    throw err;
+  }
 
   return {
     docKind,

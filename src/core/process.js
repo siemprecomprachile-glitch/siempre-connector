@@ -1,8 +1,8 @@
-import { config } from '../config.js';
+import { config, channelStartAt } from '../config.js';
 import { orders, events } from '../db.js';
 import { log } from '../logger.js';
 import { getChannel } from '../channels/index.js';
-import { issueDocument } from '../bsale/documents.js';
+import { issueDocument, decideDocKind, salesIdFor } from '../bsale/documents.js';
 import { issueCreditNote } from '../bsale/credit-notes.js';
 
 const MAX_ATTEMPTS = 8;
@@ -30,9 +30,26 @@ export function registerOrder(channel, externalId) {
  *
  * @param {object} opts
  * @param {object} [opts.canonicalOverride] orden ya canonica (Shopify la manda en el webhook)
+ * @param {boolean} [opts.manual] accion explicita del panel: no la frena la fecha de inicio
  */
-export async function processOrder(channelName, externalId, { canonicalOverride } = {}) {
+export async function processOrder(channelName, externalId, { canonicalOverride, manual = false } = {}) {
+  // Falla segura: un canal sin fecha de inicio no factura ventas nuevas solo.
+  // Sin esto, encender un canal facturaria todo lo de las ultimas 48 horas,
+  // incluidas ventas que ya se facturaron a mano. Las ventas que ya estan
+  // registradas siguen su curso (ya fueron admitidas antes).
+  if (!manual && !channelStartAt(channelName) && !orders.find(channelName, externalId)) {
+    log.warn('order.blocked_no_start_at', { channel: channelName, externalId });
+    return {
+      status: 'blocked',
+      reason: `Falta ${channelName.toUpperCase()}_START_AT: el canal no factura solo sin fecha de inicio`,
+    };
+  }
+
   const record = registerOrder(channelName, externalId);
+  if (manual && !record.manual_ok) {
+    orders.update(record.id, { manual_ok: 1 });
+    record.manual_ok = 1;
+  }
 
   // Ya facturada. El aviso puede ser un duplicado (no se hace nada) o la
   // noticia de que la venta se cayo despues (toca nota de credito).
@@ -51,13 +68,19 @@ export async function processOrder(channelName, externalId, { canonicalOverride 
     log.info('order.already_done', { channel: channelName, externalId });
     return { status: 'done', skipped: true, record };
   }
-  if (record.status === 'skipped') {
+  // Una omitida solo se vuelve a mirar por accion explicita (p. ej. una venta
+  // anterior a la fecha de inicio que quieres facturar a mano).
+  if (record.status === 'skipped' && !manual) {
     return { status: 'skipped', skipped: true, record };
   }
 
   // Estados de nota de credito: la venta ya tiene su documento y su anulacion
   // en curso o resuelta. Un aviso que llegue ahora NO puede volver a facturar.
-  if (['credited', 'credit_retry', 'credit_failed', 'review'].includes(record.status)) {
+  if (
+    ['credited', 'credit_retry', 'credit_failed', 'credit_pending', 'credit_review', 'review'].includes(
+      record.status
+    )
+  ) {
     log.info('order.already_credited', { channel: channelName, externalId, status: record.status });
     return { status: record.status, skipped: true, record };
   }
@@ -69,6 +92,8 @@ export async function processOrder(channelName, externalId, { canonicalOverride 
     return { status: 'processing', skipped: true, record };
   }
   if (record.attempts >= MAX_ATTEMPTS) {
+    // Una orden colgada en "processing" que ya agoto intentos no se vuelve a tomar.
+    if (record.status !== 'failed') orders.update(record.id, { status: 'failed' });
     return { status: 'failed', record };
   }
 
@@ -106,6 +131,21 @@ export async function processOrder(channelName, externalId, { canonicalOverride 
       canonical = result.canonical;
     }
 
+    // Fecha de inicio: una venta anterior nunca se factura automaticamente
+    // (probablemente ya se facturo a mano). No aplica a acciones manuales ni a
+    // una emision que ya se intento: esa hay que cerrarla con el mismo salesId.
+    const startAt = channelStartAt(channelName);
+    if (!record.manual_ok && !record.emit_doc_kind && startAt && canonical.createdAt < startAt) {
+      const motivo = `Venta anterior a la fecha de inicio (${startAt.toISOString()}): no se factura automatico`;
+      orders.update(record.id, {
+        status: 'skipped',
+        last_error: motivo,
+        raw_order: JSON.stringify(raw ?? canonical),
+      });
+      events.add('info', `Omitida: ${motivo}`, { channel: channelName, orderRef: externalId });
+      return { status: 'skipped', reason: 'before_start' };
+    }
+
     // Margen para cancelaciones: no facturamos antes de tiempo.
     if (config.rules.billingDelayMinutes > 0) {
       const readyAt = canonical.createdAt.getTime() + config.rules.billingDelayMinutes * 60000;
@@ -119,14 +159,31 @@ export async function processOrder(channelName, externalId, { canonicalOverride 
       }
     }
 
+    // El tipo de documento se fija ANTES de llamar a Bsale y se reusa en cada
+    // reintento. salesId evita duplicados solo dentro del mismo tipo: si un
+    // reintento cambiara boleta por factura, Bsale emitiria un segundo documento.
+    const docKind = record.emit_doc_kind || decideDocKind(canonical);
+
     orders.update(record.id, {
       customer_name: canonical.customer.name,
       customer_rut: canonical.customer.rut,
       total: canonical.total,
       raw_order: JSON.stringify(raw ?? canonical),
+      emit_doc_kind: docKind,
+      emit_started_at: Date.now(),
     });
 
-    const issued = await issueDocument(canonical);
+    let issued;
+    try {
+      issued = await issueDocument(canonical, {
+        docKind,
+        salesId: salesIdFor(channelName, externalId),
+      });
+    } catch (err) {
+      // Solo se libera el tipo si hay certeza de que Bsale no creo nada.
+      if (nothingWasCreated(err)) orders.update(record.id, { emit_doc_kind: null });
+      throw err;
+    }
 
     orders.update(record.id, {
       status: 'done',
@@ -158,6 +215,18 @@ export async function processOrder(channelName, externalId, { canonicalOverride 
 
     return { status: 'done', document: issued };
   } catch (err) {
+    // Factura sin razon social / giro / direccion: no es un error que se
+    // arregle reintentando ni se cambia a boleta. Queda esperando el dato.
+    if (err.code === 'MISSING_INVOICE_DATA') {
+      orders.update(record.id, {
+        status: 'needs_data',
+        last_error: err.message,
+        next_attempt_at: null,
+      });
+      events.add('warn', err.message, { channel: channelName, orderRef: externalId, detail: { missing: err.missing } });
+      log.warn('order.needs_data', { channel: channelName, externalId, missing: err.missing });
+      return { status: 'needs_data', error: err.message, missing: err.missing };
+    }
     const permanent = Boolean(err.permanent) || attempts >= MAX_ATTEMPTS;
     orders.update(record.id, {
       status: permanent ? 'failed' : 'retry',
@@ -178,6 +247,17 @@ export async function processOrder(channelName, externalId, { canonicalOverride 
     });
     return { status: permanent ? 'failed' : 'retry', error: err.message };
   }
+}
+
+/**
+ * true solo cuando es seguro que Bsale NO creo el documento: la peticion nunca
+ * salio, o Bsale la rechazo con un 4xx definitivo. Un error de red, un timeout
+ * o un 5xx son ambiguos (Bsale pudo haberlo creado igual).
+ */
+function nothingWasCreated(err) {
+  if (err.postAttempted === false) return true;
+  const s = Number(err.status);
+  return err.name === 'BsaleError' && s >= 400 && s < 500 && s !== 408 && s !== 429;
 }
 
 /**
@@ -213,8 +293,16 @@ async function subirDocumentoAlCanal(channelName, externalId, issued) {
  *
  * El documento original NO se toca: en Chile un documento tributario emitido
  * no se borra. Queda la boleta y ademas la nota de credito que la anula.
+ *
+ * Protecciones (Bsale no tiene salesId para devoluciones):
+ *  - Apagada por defecto (AUTO_CREDIT_NOTES=false): la devolucion queda en
+ *    'credit_pending' hasta que la apruebas en el panel (opts.manual).
+ *  - Antes de emitir se consulta en Bsale si el documento ya tiene una
+ *    devolucion. Si la tiene, no se emite otra.
+ *  - Un error ambiguo (red, timeout, 5xx, caida del proceso) deja la venta en
+ *    'credit_review': nunca se reintenta sola.
  */
-export async function processRefund(channelName, externalId, info = {}) {
+export async function processRefund(channelName, externalId, info = {}, { manual = false } = {}) {
   const record = orders.find(channelName, externalId);
 
   if (!record) {
@@ -254,7 +342,40 @@ export async function processRefund(channelName, externalId, info = {}) {
     return { status: 'review', reason: 'parcial' };
   }
 
+  // Otra ejecucion esta emitiendo esta NC. Si el candado quedo viejo, el
+  // proceso se cayo a mitad: no se sabe si Bsale la creo -> revision.
+  if (record.status === 'credit_processing') {
+    if (Date.now() - record.updated_at < STALE_LOCK_MS) {
+      return { status: 'credit_processing', skipped: true, record };
+    }
+    return marcarRevisionNC(record, channelName, externalId, motive,
+      'El proceso se cayo mientras se emitia la nota de credito. Revisa en Bsale si existe antes de reintentar.');
+  }
+
+  if (!manual && !config.rules.autoCreditNotes) {
+    if (record.status !== 'credit_pending') {
+      orders.update(record.id, {
+        status: 'credit_pending',
+        nc_motive: motive,
+        last_error:
+          `Devolucion detectada (${motive}) sobre ${record.doc_kind || 'documento'} N° ${record.bsale_number}. ` +
+          'La nota de credito automatica esta apagada: emitela desde el panel.',
+        next_attempt_at: null,
+      });
+      events.add('warn', 'Devolucion detectada: falta tu aprobacion para la nota de credito', {
+        channel: channelName,
+        orderRef: externalId,
+      });
+    }
+    return { status: 'credit_pending' };
+  }
+
   const attempts = (record.attempts || 0) + 1;
+  orders.update(record.id, {
+    status: 'credit_processing',
+    nc_motive: motive,
+    nc_started_at: Date.now(),
+  });
 
   try {
     const nc = await issueCreditNote({ documentId: record.bsale_document_id, motive });
@@ -279,6 +400,13 @@ export async function processRefund(channelName, externalId, info = {}) {
 
     return { status: 'credited', creditNote: nc };
   } catch (err) {
+    if (err.code === 'RETURN_EXISTS') {
+      return marcarRevisionNC(record, channelName, externalId, motive, err.message);
+    }
+    if (!nothingWasCreated(err)) {
+      return marcarRevisionNC(record, channelName, externalId, motive,
+        `No se sabe si Bsale creo la nota de credito (${err.message}). Revisa en Bsale antes de reintentar; no se reintenta sola.`);
+    }
     const permanent = Boolean(err.permanent) || attempts >= MAX_ATTEMPTS;
     orders.update(record.id, {
       status: permanent ? 'credit_failed' : 'credit_retry',
@@ -296,19 +424,34 @@ export async function processRefund(channelName, externalId, info = {}) {
   }
 }
 
-/** Vuelve a intentar una orden marcada como fallida (desde el panel). */
+function marcarRevisionNC(record, channelName, externalId, motive, mensaje) {
+  orders.update(record.id, {
+    status: 'credit_review',
+    nc_motive: motive,
+    last_error: mensaje,
+    next_attempt_at: null,
+  });
+  events.add('error', `Nota de credito: ${mensaje}`, { channel: channelName, orderRef: externalId });
+  log.error('order.credit_review', { channel: channelName, externalId, msg: mensaje });
+  return { status: 'credit_review', error: mensaje };
+}
+
+const CREDIT_STATUSES = ['credit_failed', 'credit_retry', 'credit_pending', 'credit_review'];
+
+/** Vuelve a intentar una orden desde el panel. Es una accion explicita. */
 export async function retryOrder(id) {
   const record = orders.get(id);
   if (!record) throw new Error('Orden no encontrada');
 
-  // Si lo que fallo fue la nota de credito, se reintenta esa, no la venta.
-  if (record.status === 'credit_failed' || record.status === 'credit_retry') {
+  // Si lo pendiente es la nota de credito, se trabaja esa, no la venta. Aun a
+  // mano, se consulta Bsale antes de emitir para no duplicar la NC.
+  if (CREDIT_STATUSES.includes(record.status)) {
     orders.update(id, { attempts: 0, next_attempt_at: null, last_error: null });
-    return processRefund(record.channel, record.external_id, { motive: record.nc_motive });
+    return processRefund(record.channel, record.external_id, { motive: record.nc_motive }, { manual: true });
   }
 
   orders.update(id, { status: 'pending', attempts: 0, next_attempt_at: null, last_error: null });
-  return processOrder(record.channel, record.external_id);
+  return processOrder(record.channel, record.external_id, { manual: true });
 }
 
-export { MAX_ATTEMPTS };
+export { MAX_ATTEMPTS, STALE_LOCK_MS };

@@ -36,6 +36,9 @@ const STATUS_LABEL = {
   credited: 'Anulado con NC',
   credit_retry: 'NC reintentando',
   credit_failed: 'NC con error',
+  credit_processing: 'Emitiendo NC',
+  credit_pending: 'Devolucion: aprueba la NC',
+  credit_review: 'NC: revisar en Bsale',
   review: 'Necesita tu mano',
 };
 
@@ -53,11 +56,27 @@ export function renderPanel({ token, counts, orders, events, ml, missingConfig, 
   } else if (ml.expired) {
     avisos.push('El token de Mercado Libre expiro; se renovara solo en el proximo pedido.');
   }
+  for (const c of channels) {
+    if (c.enabled && !c.startAt) {
+      avisos.push(
+        `${esc(c.label)} esta encendido pero sin <b>${esc(c.name.toUpperCase())}_START_AT</b>` +
+          `${c.startAtInvalid ? ' valida' : ''}: no factura nada automatico.`
+      );
+    }
+  }
 
   const tarjetas = [
     ['Emitidos', counts.done || 0, 'ok'],
     ['En cola', (counts.pending || 0) + (counts.retry || 0) + (counts.credit_retry || 0), 'warn'],
-    ['Con error', (counts.failed || 0) + (counts.credit_failed || 0) + (counts.review || 0), 'bad'],
+    [
+      'Necesitan tu mano',
+      (counts.failed || 0) +
+        (counts.credit_failed || 0) +
+        (counts.review || 0) +
+        (counts.credit_pending || 0) +
+        (counts.credit_review || 0),
+      'bad',
+    ],
     ['Anulados con NC', counts.credited || 0, 'muted'],
   ];
 
@@ -110,13 +129,13 @@ export function renderPanel({ token, counts, orders, events, ml, missingConfig, 
   .pill { display:inline-block; padding:2px 8px; border-radius:99px; font-size:11px; font-weight:600; }
   .p-done{background:#e3f5e9;color:#0a7d35}
   .p-failed,.p-credit_failed{background:#fde8e6;color:#b42318}
-  .p-retry,.p-pending,.p-processing,.p-credit_retry,.p-review{background:#fdf0dc;color:#b45309}
+  .p-retry,.p-pending,.p-processing,.p-credit_retry,.p-credit_processing,.p-credit_pending,.p-credit_review,.p-review{background:#fdf0dc;color:#b45309}
   .p-skipped{background:#eceef1;color:#6b7280}
   .p-credited{background:#e8e6f5;color:#4b3f9e}
   @media (prefers-color-scheme: dark) {
     .p-done{background:#14311f;color:#3ecf6e}
     .p-failed,.p-credit_failed{background:#3a1a18;color:#f0685e}
-    .p-retry,.p-pending,.p-processing,.p-credit_retry,.p-review{background:#332512;color:#f0a03c}
+    .p-retry,.p-pending,.p-processing,.p-credit_retry,.p-credit_processing,.p-credit_pending,.p-credit_review,.p-review{background:#332512;color:#f0a03c}
     .p-skipped{background:#23272e;color:#9aa3ae}
     .p-credited{background:#221f38;color:#a89ef0}
   }
@@ -162,6 +181,15 @@ export function renderPanel({ token, counts, orders, events, ml, missingConfig, 
     <a class="btn ghost" href="/health">Estado tecnico</a>
   </div>
 
+  <form class="bar" method="get" action="/panel/prueba">
+    <input type="hidden" name="token" value="${esc(token)}">
+    <select name="canal">${channels
+      .map((c) => `<option value="${esc(c.name)}">${esc(c.label)}</option>`)
+      .join('')}</select>
+    <input name="pedido" placeholder="N° de pedido" required>
+    <button class="ghost" type="submit">Prueba controlada: ver documento previsto</button>
+  </form>
+
   <h2>Ultimas ordenes</h2>
   <div class="tablewrap">
     <table>
@@ -201,10 +229,16 @@ export function renderPanel({ token, counts, orders, events, ml, missingConfig, 
               ${o.last_error ? `<div class="err">${esc(o.last_error)}</div>` : ''}</td>
           <td class="muted-txt">${fecha(o.created_at)}</td>
           <td>${
-            ['failed', 'retry', 'credit_failed', 'credit_retry'].includes(o.status)
+            ['failed', 'retry', 'credit_failed', 'credit_retry', 'credit_pending', 'credit_review'].includes(o.status)
               ? `<form method="post" action="/panel/retry/${o.id}">
                    <input type="hidden" name="token" value="${esc(token)}">
-                   <button class="ghost" type="submit">Reintentar</button>
+                   <button class="ghost" type="submit">${
+                     o.status === 'credit_pending'
+                       ? 'Emitir nota de credito'
+                       : o.status === 'credit_review'
+                         ? 'Ya revise Bsale: reintentar NC'
+                         : 'Reintentar'
+                   }</button>
                  </form>`
               : ''
           }</td>

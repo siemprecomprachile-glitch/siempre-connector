@@ -94,10 +94,41 @@ export async function buildReturnPayload({ documentId, motive, parcial }) {
   };
 }
 
-/** Emite la nota de credito y devuelve sus datos. */
+/**
+ * Emite la nota de credito y devuelve sus datos.
+ *
+ * Bsale no acepta un id externo en /returns.json, asi que la proteccion contra
+ * duplicados es consultar antes: si el documento ya tiene una devolucion, no se
+ * crea otra (err.code = 'RETURN_EXISTS'). Si falla, `postAttempted` dice si la
+ * peticion de emision llego a salir.
+ */
 export async function issueCreditNote({ documentId, motive, parcial }) {
-  const payload = await buildReturnPayload({ documentId, motive, parcial });
-  const devolucion = await bsale.createReturn(payload);
+  let payload;
+  try {
+    const previas = await bsale.returnsForDocument(documentId);
+    if (previas.length) {
+      const ids = previas.map((r) => r.id).join(', ');
+      const err = new Error(
+        `Bsale ya tiene ${previas.length} devolucion(es) para el documento ${documentId} (id ${ids}). ` +
+          'No se emite otra nota de credito: revisa en Bsale.'
+      );
+      err.code = 'RETURN_EXISTS';
+      err.permanent = true;
+      throw err;
+    }
+    payload = await buildReturnPayload({ documentId, motive, parcial });
+  } catch (err) {
+    err.postAttempted = false;
+    throw err;
+  }
+
+  let devolucion;
+  try {
+    devolucion = await bsale.createReturn(payload);
+  } catch (err) {
+    err.postAttempted = true;
+    throw err;
+  }
 
   // La NC puede venir anidada en la devolucion segun el tipo de respuesta.
   const nc = devolucion?.creditNote || devolucion?.document || devolucion;
