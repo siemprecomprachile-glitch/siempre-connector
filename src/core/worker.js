@@ -1,7 +1,7 @@
 import { orders, events } from '../db.js';
 import { config } from '../config.js';
 import { log } from '../logger.js';
-import { processOrder, processRefund } from './process.js';
+import { processOrder, processRefund, STALE_LOCK_MS } from './process.js';
 import { enabledChannels } from '../channels/index.js';
 
 let running = false;
@@ -11,7 +11,7 @@ export async function tick() {
   if (running) return;
   running = true;
   try {
-    const due = orders.dueForRetry(20);
+    const due = orders.dueForRetry(20, STALE_LOCK_MS);
     for (const record of due) {
       if (record.status === 'credit_retry') {
         await processRefund(record.channel, record.external_id, { motive: record.nc_motive });
