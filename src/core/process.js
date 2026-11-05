@@ -2,7 +2,7 @@ import { config } from '../config.js';
 import { orders, events } from '../db.js';
 import { log } from '../logger.js';
 import { getChannel } from '../channels/index.js';
-import { issueDocument } from '../bsale/documents.js';
+import { issueDocument, decideDocKind, salesIdFor } from '../bsale/documents.js';
 import { issueCreditNote } from '../bsale/credit-notes.js';
 
 const MAX_ATTEMPTS = 8;
@@ -69,6 +69,8 @@ export async function processOrder(channelName, externalId, { canonicalOverride 
     return { status: 'processing', skipped: true, record };
   }
   if (record.attempts >= MAX_ATTEMPTS) {
+    // Una orden colgada en "processing" que ya agoto intentos no se vuelve a tomar.
+    if (record.status !== 'failed') orders.update(record.id, { status: 'failed' });
     return { status: 'failed', record };
   }
 
@@ -119,14 +121,31 @@ export async function processOrder(channelName, externalId, { canonicalOverride 
       }
     }
 
+    // El tipo de documento se fija ANTES de llamar a Bsale y se reusa en cada
+    // reintento. salesId evita duplicados solo dentro del mismo tipo: si un
+    // reintento cambiara boleta por factura, Bsale emitiria un segundo documento.
+    const docKind = record.emit_doc_kind || decideDocKind(canonical);
+
     orders.update(record.id, {
       customer_name: canonical.customer.name,
       customer_rut: canonical.customer.rut,
       total: canonical.total,
       raw_order: JSON.stringify(raw ?? canonical),
+      emit_doc_kind: docKind,
+      emit_started_at: Date.now(),
     });
 
-    const issued = await issueDocument(canonical);
+    let issued;
+    try {
+      issued = await issueDocument(canonical, {
+        docKind,
+        salesId: salesIdFor(channelName, externalId),
+      });
+    } catch (err) {
+      // Solo se libera el tipo si hay certeza de que Bsale no creo nada.
+      if (nothingWasCreated(err)) orders.update(record.id, { emit_doc_kind: null });
+      throw err;
+    }
 
     orders.update(record.id, {
       status: 'done',
@@ -178,6 +197,17 @@ export async function processOrder(channelName, externalId, { canonicalOverride 
     });
     return { status: permanent ? 'failed' : 'retry', error: err.message };
   }
+}
+
+/**
+ * true solo cuando es seguro que Bsale NO creo el documento: la peticion nunca
+ * salio, o Bsale la rechazo con un 4xx definitivo. Un error de red, un timeout
+ * o un 5xx son ambiguos (Bsale pudo haberlo creado igual).
+ */
+function nothingWasCreated(err) {
+  if (err.postAttempted === false) return true;
+  const s = Number(err.status);
+  return err.name === 'BsaleError' && s >= 400 && s < 500 && s !== 408 && s !== 429;
 }
 
 /**
@@ -311,4 +341,4 @@ export async function retryOrder(id) {
   return processOrder(record.channel, record.external_id);
 }
 
-export { MAX_ATTEMPTS };
+export { MAX_ATTEMPTS, STALE_LOCK_MS };
