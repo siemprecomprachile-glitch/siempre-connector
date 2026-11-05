@@ -7,8 +7,13 @@ const IVA = 0.19;
 
 /**
  * Decide boleta o factura.
- * Regla: hay factura solo si el comprador entrego RUT valido Y razon social.
- * Sin razon social el SII no acepta la factura, asi que cae a boleta.
+ * Reglas:
+ *  - Si el canal dice que pidio el comprador (Paris), se respeta.
+ *  - RUT con razon social, o RUT de empresa: factura.
+ *  - RUT de empresa SIN razon social: sigue siendo factura, y la emision se
+ *    bloquea pidiendo el dato que falta (buildClient). Nunca se cambia a boleta
+ *    por cuenta propia.
+ *  - Sin RUT, o RUT de persona sin razon social: boleta.
  */
 export function decideDocKind(order) {
   // Si el canal ya sabe lo que el comprador pidio, se le hace caso.
@@ -47,11 +52,13 @@ function buildClient(order, docKind) {
     if (!order.customer.address) missing.push('direccion');
     if (missing.length) {
       const err = new Error(
-        `No se puede emitir factura: falta ${missing.join(', ')}. ` +
-          `Completa los datos en el canal o emite boleta.`
+        `Factura bloqueada: falta ${missing.join(', ')}` +
+          `${rut ? ` del RUT ${rut}` : ''}. Pide el dato al comprador o completalo en el canal ` +
+          'y vuelve a intentar. No se emite boleta en su lugar.'
       );
       err.permanent = true;
       err.code = 'MISSING_INVOICE_DATA';
+      err.missing = missing;
       throw err;
     }
     return {
