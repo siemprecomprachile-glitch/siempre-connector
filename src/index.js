@@ -1,5 +1,5 @@
 import express from 'express';
-import { config, assertConfig } from './config.js';
+import { config, assertConfig, channelStartInfo } from './config.js';
 import { log } from './logger.js';
 import { orders, events, storage } from './db.js';
 import { probeChannel, previewOrder } from './core/diagnostics.js';
@@ -11,6 +11,8 @@ import { allChannels } from './channels/index.js';
 import { renderPanel } from './web/panel.js';
 import { bsale } from './bsale/client.js';
 import { resolveDocTypeIds, docTypeSummary } from './bsale/doctypes.js';
+import { renderPreviewPage, renderResultPage } from './web/prueba.js';
+import { runSalesIdSelfTest } from './bsale/selftest.js';
 
 /** Estado de cada canal para el panel y para /health. */
 function channelStatus() {
@@ -19,6 +21,7 @@ function channelStatus() {
     label: c.label,
     enabled: c.enabled,
     connected: typeof c.isConnected === 'function' ? c.isConnected() : undefined,
+    ...channelStartInfo(c.name),
   }));
 }
 
@@ -47,6 +50,7 @@ app.get('/health', (_req, res) => {
     mercadolibre: mercadolibreChannel.connectionInfo(),
     orders: orders.counts(),
     bsaleDocTypes: docTypeSummary(),
+    autoCreditNotes: config.rules.autoCreditNotes,
     storage: storage.info(),
   });
 });
@@ -243,6 +247,93 @@ app.get('/panel/canales/:name/pedido/:id', requireAdmin, async (req, res) => {
     res.json(await previewOrder(req.params.name, req.params.id));
   } catch (err) {
     res.status(400).json({ ok: false, sentToBsale: false, error: err.message });
+  }
+});
+
+// Prueba controlada de UN pedido (ver web/prueba.js). GET = solo mirar;
+// emitir es un POST aparte que exige escribir el numero de pedido. Funciona con
+// el canal apagado y no barre nada mas.
+app.get('/panel/prueba', requireAdmin, (req, res) => {
+  const canal = encodeURIComponent(String(req.query.canal || ''));
+  const pedido = encodeURIComponent(String(req.query.pedido || '').trim());
+  res.redirect(`/panel/prueba/${canal}/${pedido}?token=${encodeURIComponent(req.query.token)}`);
+});
+
+app.get('/panel/prueba/:name/:id', requireAdmin, async (req, res) => {
+  const { name, id } = req.params;
+  let preview = null;
+  let error = null;
+  try {
+    preview = await previewOrder(name, id);
+  } catch (err) {
+    error = err.message;
+  }
+  res.type('html').send(
+    renderPreviewPage({ token: String(req.query.token), name, id, preview, error, declareSii: config.bsale.declareSii })
+  );
+});
+
+app.post('/panel/prueba/:name/:id/emitir', requireAdmin, async (req, res) => {
+  const { name, id } = req.params;
+  const token = String(req.body.token || req.query.token || '');
+  const show = (status, data) => res.status(status).type('html').send(renderResultPage({ token, name, id, ...data }));
+
+  if (String(req.body.confirm || '').trim() !== String(id)) {
+    return show(400, { error: 'No se emitio: para confirmar hay que escribir el numero de pedido exacto.' });
+  }
+  let preview;
+  try {
+    preview = await previewOrder(name, id);
+  } catch (err) {
+    return show(400, { error: `No se emitio: no se pudo releer el pedido (${err.message}).` });
+  }
+  if (preview.skip || preview.retryLater) {
+    return show(409, { error: `No se emitio: ${preview.skip || preview.retryLater}` });
+  }
+  if (preview.existingDocument) {
+    return show(409, { error: `No se emitio: el pedido ya tiene ${preview.existingDocument.kind} N° ${preview.existingDocument.number}.` });
+  }
+  const expectedTotal = Number(req.body.expectedTotal);
+  if (preview.docKind !== req.body.expectedKind || preview.order.total !== expectedTotal) {
+    return show(409, {
+      error:
+        `No se emitio: el pedido cambio desde la vista previa ` +
+        `(antes ${req.body.expectedKind} por ${expectedTotal}, ahora ${preview.docKind} por ${preview.order.total}). Vuelve a revisarlo.`,
+    });
+  }
+
+  events.add('info', `Prueba controlada: emision manual de ${name} #${id}`, { channel: name, orderRef: id });
+  const result = await processOrder(name, id, { manual: true });
+  show(result.status === 'done' ? 200 : 502, { result });
+});
+
+// Validacion de salesId en la EMPRESA DE PRUEBAS de Bsale (bsale/selftest.js).
+// Solo corre si BSALE_TEST_ACCESS_TOKEN esta definido y es distinto del real.
+app.get('/panel/bsale/prueba-salesid', requireAdmin, (req, res) => {
+  const listo = Boolean(process.env.BSALE_TEST_ACCESS_TOKEN);
+  res.type('html').send(
+    `<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">` +
+      `<style>body{font-family:system-ui,sans-serif;max-width:760px;margin:0 auto;padding:24px 16px;line-height:1.5}</style>` +
+      `<h2>Validar salesId en la empresa de pruebas de Bsale</h2>` +
+      (listo
+        ? `<p>Crea boletas (y una factura) <b>de prueba</b> con declareSii=0 en la empresa del token BSALE_TEST_ACCESS_TOKEN. No usa el token real.</p>` +
+          `<form method="post"><input type="hidden" name="token" value="${String(req.query.token).replace(/"/g, '&quot;')}">` +
+          `<p>Escribe PRUEBA: <input name="confirm" autocomplete="off" required> <button type="submit">Ejecutar</button></p></form>`
+        : `<p>Falta <b>BSALE_TEST_ACCESS_TOKEN</b> en Render (token de la empresa de pruebas de account.bsale.dev).</p>`)
+  );
+});
+
+app.post('/panel/bsale/prueba-salesid', requireAdmin, async (req, res) => {
+  if (String(req.body.confirm || '').trim() !== 'PRUEBA') return res.status(400).send('No se ejecuto: escribe PRUEBA.');
+  try {
+    const r = await runSalesIdSelfTest({
+      token: process.env.BSALE_TEST_ACCESS_TOKEN,
+      realToken: config.bsale.token,
+      apiUrl: process.env.BSALE_TEST_API_URL,
+    });
+    res.json(r);
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
   }
 });
 
