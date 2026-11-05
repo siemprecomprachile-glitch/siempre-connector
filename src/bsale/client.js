@@ -91,4 +91,13 @@ export const bsale = {
 
   /** Crea la devolucion y su nota de credito. */
   createReturn: (payload) => request('POST', '/returns.json', payload),
+
+  /** Devoluciones ya hechas sobre un documento (filtro referencedocumentid). */
+  async returnsForDocument(documentId) {
+    const res = await request(
+      'GET',
+      `/returns.json?referencedocumentid=${encodeURIComponent(documentId)}&limit=50`
+    );
+    return res?.items || [];
+  },
 };
