@@ -1,5 +1,5 @@
 import { orders, events } from '../db.js';
-import { config } from '../config.js';
+import { config, channelStartAt } from '../config.js';
 import { log } from '../logger.js';
 import { processOrder, processRefund, STALE_LOCK_MS } from './process.js';
 import { enabledChannels } from '../channels/index.js';
@@ -13,8 +13,11 @@ export async function tick() {
   try {
     const due = orders.dueForRetry(20, STALE_LOCK_MS);
     for (const record of due) {
-      if (record.status === 'credit_retry') {
-        await processRefund(record.channel, record.external_id, { motive: record.nc_motive });
+      if (record.status === 'credit_retry' || record.status === 'credit_processing') {
+        // Solo llega a credit_retry una NC ya aprobada (a mano o con
+        // AUTO_CREDIT_NOTES): el reintento respeta esa aprobacion. El
+        // pre-chequeo en Bsale sigue evitando una segunda NC.
+        await processRefund(record.channel, record.external_id, { motive: record.nc_motive }, { manual: true });
       } else {
         await processOrder(record.channel, record.external_id);
       }
@@ -30,10 +33,25 @@ export async function tick() {
  * Red de seguridad: si un webhook se pierde (ML reintenta, pero no para siempre),
  * este barrido encuentra las ventas que nunca llegaron y las factura igual.
  */
+const avisadoSinFecha = new Set();
+
 export async function sweepChannels() {
   for (const channel of enabledChannels()) {
     if (typeof channel.listRecentOrderIds !== 'function') continue;
     if (channel.isConnected && !channel.isConnected()) continue;
+    // Encendido pero sin fecha de inicio: no se barre nada (no factura las
+    // ultimas 48 h de golpe). Se avisa una vez por arranque.
+    if (!channelStartAt(channel.name)) {
+      if (!avisadoSinFecha.has(channel.name)) {
+        avisadoSinFecha.add(channel.name);
+        const variable = `${channel.name.toUpperCase()}_START_AT`;
+        events.add('warn', `Canal encendido sin ${variable}: no se factura nada automatico`, {
+          channel: channel.name,
+        });
+        log.warn('worker.sweep_sin_fecha_inicio', { channel: channel.name, variable });
+      }
+      continue;
+    }
     try {
       const ids = await channel.listRecentOrderIds(50);
       let nuevas = 0;
