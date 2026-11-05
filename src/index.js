@@ -293,6 +293,30 @@ app.post('/panel/prueba/:name/:id/emitir', requireAdmin, async (req, res) => {
   if (preview.existingDocument) {
     return show(409, { error: `No se emitio: el pedido ya tiene ${preview.existingDocument.kind} N° ${preview.existingDocument.number}.` });
   }
+  if (preview.blocked) {
+    return show(409, { error: `No se emitio. ${preview.blocked.message}` });
+  }
+  // ¿Ya facturado a mano o por otra integracion? salesId no lo detecta.
+  if (!preview.existingCheck.ok) {
+    return show(409, {
+      error: `No se emitio: no se pudo revisar en Bsale si la venta ya esta facturada (${preview.existingCheck.error}).`,
+    });
+  }
+  const seguros = preview.existingCheck.candidates.filter((c) => c.mentionsOrder);
+  if (seguros.length) {
+    return show(409, {
+      error:
+        `No se emitio: en Bsale ya hay ${seguros.map((c) => `${c.documentType || 'documento'} N° ${c.number}`).join(', ')} ` +
+        `que menciona el pedido ${id}. Esta venta parece facturada.`,
+    });
+  }
+  if (preview.existingCheck.candidates.length && req.body.revisado !== 'si') {
+    return show(409, {
+      error:
+        `No se emitio: hay ${preview.existingCheck.candidates.length} documento(s) parecidos en Bsale (mismo monto o RUT). ` +
+        'Revisalos y marca la casilla de la vista previa si no son esta venta.',
+    });
+  }
   const expectedTotal = Number(req.body.expectedTotal);
   if (preview.docKind !== req.body.expectedKind || preview.order.total !== expectedTotal) {
     return show(409, {
