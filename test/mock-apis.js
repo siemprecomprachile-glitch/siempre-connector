@@ -32,9 +32,10 @@ export function setTestEnv(dataDir, { parisStartAt = '2020-01-01T00:00:00Z' } = 
 }
 
 /** Orden de Walmart con lineas en los estados indicados. */
-export function walmartOrder(id, estados, { price = 11900 } = {}) {
+export function walmartOrder(id, estados, { price = 11900, rut } = {}) {
   return {
     purchaseOrderId: id,
+    ...(rut ? { taxId: rut } : {}),
     customerOrderId: `C${id}`,
     orderDate: Date.now() - 3600 * 1000,
     shippingInfo: { phone: '+56900000000', postalAddress: { name: 'Ana Rojas', address1: 'Calle 2', city: 'Santiago' } },
@@ -50,7 +51,7 @@ export function walmartOrder(id, estados, { price = 11900 } = {}) {
   };
 }
 
-export function subOrder(n, { factura = false } = {}) {
+export function subOrder(n, { factura = false, price = 11900, rut = '11.111.111-1', business } = {}) {
   return {
     subOrderNumber: n,
     originOrderDate: new Date(Date.now() - 3600 * 1000).toISOString(),
@@ -58,14 +59,17 @@ export function subOrder(n, { factura = false } = {}) {
     customer: {
       name: 'Juan Perez',
       documentType: 'RUT',
-      documentNumber: '11.111.111-1',
+      documentNumber: rut,
       email: 'juan@example.cl',
     },
-    businessInvoice: factura
-      ? { documentNumber: '76.086.428-5', businessName: 'Barberia SpA', activity: 'Peluqueria' }
-      : null,
+    businessInvoice:
+      business !== undefined
+        ? business
+        : factura
+          ? { documentNumber: '76.086.428-5', businessName: 'Barberia SpA', activity: 'Peluqueria' }
+          : null,
     billingAddress: { address1: 'Calle 1', city: 'Santiago', phone: '+56900000000' },
-    items: [{ sellerSku: 'SKU-1', name: 'Maquina de corte', basePrice: 11900 }],
+    items: [{ sellerSku: 'SKU-1', name: 'Maquina de corte', basePrice: price }],
     dispatchCost: 0,
   };
 }
@@ -98,6 +102,8 @@ export function installMocks({ parisSubOrders = {}, walmartOrders = [] } = {}) {
     failNextPost: null, // 'lose-response' | 'reject-400' | 'http-502'
     failNextReturn: null, // 'lose-response' | 'reject-400'
     slowCreateMs: 0, // demora de la respuesta de POST documents (prueba de timeout)
+    ignoreSalesId: false, // simula un Bsale que NO deduplica (para ver que la prueba lo detecta)
+    failSearchTotal: null, // la busqueda por este monto falla (Bsale caido)
     nextId: 1000,
   };
 
@@ -115,14 +121,27 @@ export function installMocks({ parisSubOrders = {}, walmartOrders = [] } = {}) {
       if (u.pathname.endsWith('/documents.json') && method === 'GET') {
         const tipo = Number(u.searchParams.get('documenttypeid'));
         const total = Number(u.searchParams.get('totalamount'));
-        return json({
-          items: state.bsaleDocs.filter(
-            (d) => (!tipo || d.documentTypeId === tipo) && (!total || d.totalAmount === total)
-          ),
-        });
+        if (state.failSearchTotal && total === state.failSearchTotal) throw new TypeError('fetch failed');
+        const code = u.searchParams.get('clientcode');
+        const rango = (u.searchParams.get('emissiondaterange') || '').replace(/[[\]]/g, '').split(',').map(Number);
+        const items = state.bsaleDocs.filter(
+          (d) =>
+            (!tipo || d.documentTypeId === tipo) &&
+            (!total || d.totalAmount === total) &&
+            (!code || d.clientCode === code) &&
+            (rango.length !== 2 || (d.emissionDate >= rango[0] && d.emissionDate <= rango[1]))
+        );
+        const limit = Number(u.searchParams.get('limit')) || 25;
+        return json({ count: items.length, items: items.slice(0, limit) });
       }
       const det = u.pathname.match(/\/documents\/(\d+)\/details\.json$/);
-      if (det) return json({ items: [{ id: Number(det[1]) * 10, quantity: 1 }] });
+      if (det) {
+        const d = state.bsaleDocs.find((x) => x.id === Number(det[1]));
+        const lineas = d?.details?.length ? d.details : [{ quantity: 1 }];
+        return json({ items: lineas.map((x, i) => ({ id: Number(det[1]) * 10 + i, quantity: x.quantity ?? 1, comment: x.comment ?? null })) });
+      }
+      const refs = u.pathname.match(/\/documents\/(\d+)\/references\.json$/);
+      if (refs) return json({ items: state.bsaleDocs.find((x) => x.id === Number(refs[1]))?.references || [] });
       const one = u.pathname.match(/\/documents\/(\d+)\.json$/);
       if (one) {
         const d = state.bsaleDocs.find((x) => x.id === Number(one[1]));
@@ -154,6 +173,7 @@ export function installMocks({ parisSubOrders = {}, walmartOrders = [] } = {}) {
         if (mode === 'reject-400') return json({ error: 'documento invalido' }, 400);
 
         let doc =
+          !state.ignoreSalesId &&
           body.salesId &&
           state.bsaleDocs.find(
             (d) => d.salesId === body.salesId && d.documentTypeId === body.documentTypeId
@@ -167,6 +187,9 @@ export function installMocks({ parisSubOrders = {}, walmartOrders = [] } = {}) {
             documentTypeId: body.documentTypeId,
             salesId: body.salesId ?? null,
             totalAmount: Math.round(neto * 1.19),
+            emissionDate: body.emissionDate,
+            clientCode: body.client?.code ?? null,
+            details: body.details,
             urlPublicView: `https://bsale.test/view/${id}`,
           };
           state.bsaleDocs.push(doc);
