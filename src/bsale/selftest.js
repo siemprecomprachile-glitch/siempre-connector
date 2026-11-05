@@ -2,8 +2,15 @@
  * Validacion de `salesId` contra la EMPRESA DE PRUEBAS de Bsale.
  *
  * Usa SOLO el token que recibe (BSALE_TEST_ACCESS_TOKEN, el de la empresa de
- * pruebas de account.bsale.dev). No importa config.js: nunca toca el token real.
+ * pruebas de account.bsale.dev). No importa config.js ni lee .env: nunca toca el
+ * token real. El token es el que define la empresa en Bsale.
  * Crea boletas (y una factura, si la empresa la tiene) con declareSii=0.
+ *
+ * Protecciones para no tocar la empresa real:
+ *  - Si el token es igual a BSALE_ACCESS_TOKEN, no corre.
+ *  - Si la empresa tiene mas de `maxExistingDocs` documentos, no corre (una
+ *    empresa de pruebas tiene pocos; la real, miles).
+ *  - Antes de crear nada muestra sucursales y tipos y pide confirmacion.
  *
  * Responde cuatro preguntas:
  *  A. Mismo salesId y mismo tipo dos veces -> ¿Bsale devuelve el mismo documento?
@@ -19,8 +26,9 @@ export async function runSalesIdSelfTest({
   token,
   realToken,
   apiUrl = 'https://api.bsale.io/v1',
-  timeouts = [30, 150, 600],
-  pauseMs = 3000,
+  timeouts = [200, 700, 1500, 3000],
+  pauseMs = 5000,
+  maxExistingDocs = 300,
   fetchImpl = globalThis.fetch,
   log = () => {},
   confirm = async () => true,
@@ -77,13 +85,22 @@ export async function runSalesIdSelfTest({
   const iva = taxes.find((t) => Number(t.percentage) === 19) || taxes[0];
   if (!iva) throw new Error('La empresa no tiene impuestos configurados.');
 
+  const total = await req('GET', '/documents.json?limit=1');
+  const existentes = Number(total?.count ?? (total?.items || []).length);
   out.account = {
+    offices: offices.map((o) => ({ id: o.id, name: o.name, address: o.address ?? null })),
     officeId: office.id,
     officeName: office.name,
     boletaTypeId: boleta.id,
     facturaTypeId: factura?.id ?? null,
     taxId: iva.id,
+    documentosExistentes: existentes,
   };
+  if (existentes > maxExistingDocs) {
+    throw new Error(
+      `La empresa de este token ya tiene ${existentes} documentos: parece una empresa REAL, no la de pruebas. No se ejecuta.`
+    );
+  }
   if (!(await confirm(out.account))) {
     out.cancelled = true;
     return out;
@@ -114,9 +131,11 @@ export async function runSalesIdSelfTest({
   const guardar = (doc, nota) => {
     if (doc?.id) out.documents.push({ id: doc.id, number: doc.number ?? null, total: doc.totalAmount ?? null, nota });
   };
-  const contar = async (documentTypeId, total) =>
+  const listar = async (documentTypeId, total) =>
     ((await req('GET', `/documents.json?documenttypeid=${documentTypeId}&totalamount=${total}&limit=50`))?.items || [])
-      .length;
+      .map((d) => d.id);
+  const contar = async (documentTypeId, total) => (await listar(documentTypeId, total)).length;
+  const totalDe = (bruto) => Math.round(Number((bruto / 1.19).toFixed(4)) * 1.19);
 
   // --- A: mismo salesId, mismo tipo --------------------------------------------
   const sidA = `prueba-${run}-a`;
@@ -132,23 +151,33 @@ export async function runSalesIdSelfTest({
   });
 
   // --- B: timeout y reintento -------------------------------------------------
+  // Se corta la peticion a los `ms` milisegundos (como un timeout real), se
+  // espera y se mira si Bsale alcanzo a crear el documento. El caso que prueba
+  // de verdad salesId es: cortada + Bsale ya lo tenia + el reintento devuelve
+  // ESE mismo documento.
   for (const ms of timeouts) {
     const sid = `prueba-${run}-b${ms}`;
     const bruto = montoUnico();
     let cortado = false;
+    let primero = null;
     try {
-      const d = await req('POST', '/documents.json', payload(boleta.id, sid, bruto), { timeoutMs: ms });
-      guardar(d, `B${ms}: respuesta alcanzo a llegar`);
+      primero = await req('POST', '/documents.json', payload(boleta.id, sid, bruto), { timeoutMs: ms });
+      guardar(primero, `B${ms}: la respuesta alcanzo a llegar`);
     } catch (err) {
       cortado = true;
     }
     await sleep(pauseMs);
+    const antes = await listar(boleta.id, primero?.totalAmount ?? totalDe(bruto));
     const d2 = await req('POST', '/documents.json', payload(boleta.id, sid, bruto));
     guardar(d2, `B${ms}: reintento`);
-    const n = await contar(boleta.id, d2.totalAmount);
-    step(`B. corte a los ${ms} ms y reintento deja un solo documento`, n === 1, {
+    const despues = await listar(boleta.id, d2.totalAmount);
+    const bsaleLoTenia = antes.length === 1;
+    step(`B. corte a los ${ms} ms y reintento deja un solo documento`, despues.length === 1 && (!bsaleLoTenia || antes[0] === d2.id), {
       primerEnvioCortado: cortado,
-      documentosConEseMonto: n,
+      bsaleLoCreoAunqueSeCorto: cortado && bsaleLoTenia,
+      documentosAntesDelReintento: antes.length,
+      documentosDespues: despues.length,
+      reintentoDevolvioElMismo: bsaleLoTenia ? antes[0] === d2.id : null,
       idFinal: d2.id,
     });
   }
@@ -191,6 +220,17 @@ export async function runSalesIdSelfTest({
     valor: got?.salesId ?? null,
   });
 
+  const pasosB = out.steps.filter((s) => s.name.startsWith('B.'));
+  const pasoC = out.steps.find((s) => s.name.startsWith('C.'));
+  out.resumen = {
+    mismoPedidoMismoTipoDevuelveElMismo: out.steps.find((s) => s.name.startsWith('A.'))?.pass === true,
+    reintentosTrasCorteSinDuplicar: pasosB.every((s) => s.pass === true),
+    // Solo cuenta como probado si en algun corte Bsale alcanzo a crear el
+    // documento y el reintento devolvio ese mismo.
+    timeoutProbadoDeVerdad: pasosB.some((s) => s.pass === true && s.detail.bsaleLoCreoAunqueSeCorto),
+    siCambiaElTipo: pasoC?.detail?.resultado || pasoC?.detail?.rechazado || pasoC?.detail?.omitido || null,
+    getDevuelveSalesId: out.steps.find((s) => s.name.startsWith('D.'))?.detail?.trae ?? null,
+  };
   out.finishedAt = new Date().toISOString();
   out.allPassed = out.steps.every((s) => s.pass !== false);
   return out;
