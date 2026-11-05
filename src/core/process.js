@@ -215,6 +215,18 @@ export async function processOrder(channelName, externalId, { canonicalOverride,
 
     return { status: 'done', document: issued };
   } catch (err) {
+    // Factura sin razon social / giro / direccion: no es un error que se
+    // arregle reintentando ni se cambia a boleta. Queda esperando el dato.
+    if (err.code === 'MISSING_INVOICE_DATA') {
+      orders.update(record.id, {
+        status: 'needs_data',
+        last_error: err.message,
+        next_attempt_at: null,
+      });
+      events.add('warn', err.message, { channel: channelName, orderRef: externalId, detail: { missing: err.missing } });
+      log.warn('order.needs_data', { channel: channelName, externalId, missing: err.missing });
+      return { status: 'needs_data', error: err.message, missing: err.missing };
+    }
     const permanent = Boolean(err.permanent) || attempts >= MAX_ATTEMPTS;
     orders.update(record.id, {
       status: permanent ? 'failed' : 'retry',
